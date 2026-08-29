@@ -18,9 +18,11 @@ import torch
 
 from freetoken.kvcache.quant import (
     BLOCK,
+    LAYOUT_Q2,
     LAYOUT_Q4,
     LAYOUT_Q6,
     NONE,
+    Q2_0,
     Q4_0,
     Q6_0,
     Q8_0,
@@ -335,3 +337,69 @@ def test_q6_0_cpu_cuda_parity():
     p_cuda, s_cuda = Q6_0.quantize(x_cuda)
     assert torch.equal(p_cpu, p_cuda.cpu())
     assert torch.equal(s_cpu, s_cuda.cpu())
+
+
+# ---- Q2_0 tests ----
+
+def test_q2_0_spec_layout_and_bits():
+    """Q2_0 declares 2-bit layout, 8 bytes per 32-value block, mag=2."""
+    assert Q2_0.layout == LAYOUT_Q2
+    assert Q2_0.bits == 2
+    assert Q2_0.payload_bytes_per_block == 8
+    assert Q2_0.max_magnitude == 2.0
+
+
+def test_q2_0_bytes_per_element():
+    """Q2_0 yields 0.3125 bytes/element: 8 payload / 32 + 2 scale / 32."""
+    assert Q2_0.bytes_per_element(torch.bfloat16) == pytest.approx(0.3125)
+
+
+def test_q2_0_sign_extension_xor_sub():
+    """2-bit signed: XOR-sub maps [0, 1, 2, 3] to [-2, -1, 0, 1]. Equivalent to
+    arithmetic shift of int32 by 30."""
+    import ctypes
+
+    for unsigned in range(4):
+        signed = (unsigned ^ 0x2) - 0x2
+        assert -2 <= signed <= 1
+        shifted = ctypes.c_int32(unsigned << (32 - 2)).value >> (32 - 2)
+        assert shifted == signed, f"{unsigned}: XOR={signed}, shift={shifted}"
+
+
+def test_q2_0_single_block_layout_4_per_byte():
+    """4 values per byte at bit positions 0/2/4/6. amax=2 -> scale=1.0 -> codes
+    equal the input values. Each byte holds 4 consecutive values, with val[i]
+    occupying the 2 bits at position 2*i (LSB-first: val[0] -> bits 0-1,
+    val[3] -> bits 6-7)."""
+    block = torch.zeros(32, dtype=torch.bfloat16)
+    # amax = 2 (block[1] = -2). scale = 2/2 = 1.0 exactly.
+    block[0] = 1.0   # code 1 -> bits 01
+    block[1] = -2.0  # code 2 -> bits 10
+    block[2] = 0.0   # code 0 -> bits 00
+    block[3] = -1.0  # code 1 -> bits 01
+    x = block.unsqueeze(0).unsqueeze(0)
+    payload, scales = Q2_0.quantize(x)
+    # payload shape: [1, 1, 8] (8 bytes per block)
+    assert payload.shape == (1, 1, 8)
+    p = payload[0, 0]
+    # byte 0 = val[0..3] at bit positions 0, 2, 4, 6 (LSB-first packing).
+    # val[0]=1 (01) at bits 0-1, val[1]=2 (10) at bits 2-3,
+    # val[2]=0 (00) at bits 4-5, val[3]=1 (01) at bits 6-7
+    # = 0b11001001 = 0xC9 = 201.
+    assert p[0] == 0xC9, f"byte 0 = {p[0]} (expected 201)"
+
+
+def test_q2_0_roundtrip_oracle_kurtotic():
+    """Q2_0 quantize->dequantize gives < 0.80 rel_err on kurtotic K/V.
+
+    2-bit signed [-2, 1] is intentionally lossy; on kurtotic K/V
+    (where some values are 5x the base magnitude, i.e. 15+, vs the
+    scale=amax/2) the +/-2 clamp rounds most of the tail to +/-2, so
+    the measured rel_err on this distribution is ~0.67. The use case
+    for q2_0 is extreme-length contexts on memory-tight hardware
+    where the trade is worth it; raw accuracy is not the goal."""
+    x = _kurtotic_kv(shape=(4, 8, 128), mag=3.0)
+    payload, scales = Q2_0.quantize(x)
+    rec = Q2_0.dequantize(payload, scales)
+    err = _rel_err(rec, x)
+    assert err < 0.80, f"Q2_0 rel_err {err:.4f} exceeded 0.80 floor"

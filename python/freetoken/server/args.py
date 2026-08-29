@@ -370,7 +370,7 @@ def parse_args(
         help=(
             "KV-cache element storage. 'auto' keeps the compute dtype (bf16). 'q8_0' and "
             "'fp8_e4m3' store 8 bits plus an fp16 scale per 32 elements along head_dim "
-            "(1.0625 bytes/element vs 2), and the sub-byte 'q4_0'/'q6_0' pack multiple "
+            "(1.0625 bytes/element vs 2), and the sub-byte 'q2_0'/'q4_0'/'q6_0' pack multiple "
             "values per byte (0.5625 / 0.8125 bytes/element), freeing VRAM for the MoE "
             "expert cache. Needs the triton attention backend and head_dim divisible "
             "by 32."

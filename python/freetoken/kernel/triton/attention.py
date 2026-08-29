@@ -39,6 +39,7 @@ def _load_kv(
       * q4: 2 elements per byte, low nibble = even, high nibble = odd.
       * q6: 16-byte low plane + 8-byte high plane per 32-element block; low 4 bits
         via nibble layout, top 2 bits at bit positions 0, 2, 4, 6 of the hi plane.
+      * q2: 4 elements per byte at bit positions 0, 2, 4, 6.
     """
     if LAYOUT == "q8":
         # 1 byte per element. slot_base and elem_offsets are already broadcast
@@ -75,6 +76,16 @@ def _load_kv(
         raw6 = (lo_val | (hi_val << 4))
         se = (raw6 ^ 0x20) - 0x20
         vals = se
+    elif LAYOUT == "q2":
+        # 32-element blocks: 8 bytes, 4 values per byte at bit positions 0/2/4/6.
+        block_idx = elem_offsets >> 5
+        in_block = elem_offsets & 31
+        byte_offs = block_idx * 8 + (in_block >> 2)
+        pos = (in_block & 3) * 2
+        loaded = tl.load(ptr + slot_base + byte_offs, mask=elem_mask, other=0).to(tl.int32)
+        v2 = (loaded >> pos) & 0x3
+        # Sign-extend 2-bit: (v ^ 0x2) - 0x2 maps [0,1,2,3] -> [-2,-1,0,1].
+        vals = (v2 ^ 0x2) - 0x2
     else:
         tl.static_assert(False, f"unknown LAYOUT {LAYOUT!r}")
 
@@ -180,8 +191,11 @@ def _paged_attention_kernel(
     # Byte offset along the head_dim axis. 8-bit: 1 byte per element. Q4: 2 per
     # byte. Q6: see _load_kv (it reads two planes, so the offset it consumes is
     # the per-element raw position -- the byte address differs per plane).
+    # Q2: 4 elements per byte, so byte offset = elem >> 2.
     if LAYOUT == "q4":
         phys_offs_d = offs_d >> 1
+    elif LAYOUT == "q2":
+        phys_offs_d = offs_d >> 2
     elif LAYOUT == "q6":
         phys_offs_d = offs_d
     else:

@@ -30,6 +30,7 @@ import triton
 import triton.language as tl
 
 from freetoken.kvcache.quant import BLOCK
+from freetoken.kvcache.quant import LAYOUT_Q2 as _LAYOUT_Q2
 from freetoken.kvcache.quant import LAYOUT_Q4 as _LAYOUT_Q4
 from freetoken.kvcache.quant import LAYOUT_Q6 as _LAYOUT_Q6
 from freetoken.kvcache.quant import LAYOUT_Q8 as _LAYOUT_Q8
@@ -37,6 +38,7 @@ from freetoken.kvcache.quant import LAYOUT_Q8 as _LAYOUT_Q8
 # Bind to tl.constexpr so the @triton.jit kernel can use them in `if LAYOUT == ...`
 # (Triton 3.7.1 forbids reading plain Python globals from inside a jit function).
 LAYOUT_Q8 = tl.constexpr(_LAYOUT_Q8)
+LAYOUT_Q2 = tl.constexpr(_LAYOUT_Q2)
 LAYOUT_Q4 = tl.constexpr(_LAYOUT_Q4)
 LAYOUT_Q6 = tl.constexpr(_LAYOUT_Q6)
 
@@ -105,7 +107,6 @@ def _store_kv_quant_kernel(
             else:
                 q = tl.minimum(tl.maximum(q, -MAX_MAG), MAX_MAG)
         else:
-            # The native fp32 -> float8e4nv downcast does not round to nearest on
             # every arch (it lowers as a truncating fp32 -> fp16 -> e4m3 double-round
             # on sm_89), so values just above a grid midpoint collapse downward and
             # disagree with the RNE torch reference. Round explicitly first.
@@ -119,6 +120,24 @@ def _store_kv_quant_kernel(
             tl.store(
                 dst_ptr + slot * stride_ct + head * stride_ch + offs,
                 q.to(dst_ptr.dtype.element_ty),
+            )
+        elif LAYOUT == LAYOUT_Q2:
+            # 32 values -> 8 bytes, 4 values per byte at bit positions 0/2/4/6.
+            # value v at group position g within the byte goes to bit (2*g) of
+            # the byte. 1 << (2*g) = 1, 4, 16, 64.
+            qi = q.to(tl.int8)  # [NBLOCK, 32] in [-2, 1]
+            low2 = qi & 0x3  # [NBLOCK, 32] in [0, 3]
+            groups = tl.reshape(low2, (NBLOCK, BLOCK // 4, 4))  # [NBLOCK, 8, 4]
+            masks = tl.where(
+                tl.arange(0, 4) == 0, 1,
+                tl.where(tl.arange(0, 4) == 1, 4,
+                         tl.where(tl.arange(0, 4) == 2, 16, 64)),
+            )
+            packed = tl.sum(groups * masks[None, None, :], axis=2).to(tl.uint8)
+            byte_offs = tl.arange(0, NBLOCK)[:, None] * 8 + tl.arange(0, 8)[None, :]
+            tl.store(
+                dst_ptr + slot * stride_ct + head * stride_ch + byte_offs,
+                packed,
             )
         elif LAYOUT == LAYOUT_Q4:
             # Pack two 4-bit values per byte: low nibble = even index, high = odd.

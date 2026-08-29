@@ -45,6 +45,7 @@ STORAGE_BYTE_DTYPE = torch.uint8
 
 # Layout identifiers. Add a new one here to plug in a new scheme.
 LAYOUT_Q8 = "q8"        # 1 byte per element (Q8_0 / FP8_E4M3)
+LAYOUT_Q2 = "q2"        # 8 bytes pack 32 2-bit values (4 per byte at bits 0/2/4/6)
 LAYOUT_Q4 = "q4"        # 16 bytes pack 32 4-bit values
 LAYOUT_Q6 = "q6"        # 24 bytes pack 32 6-bit values (16 lo + 8 hi)
 
@@ -135,6 +136,8 @@ class KVQuantSpec:
         assert self.enabled, "quantize() on an unquantized spec"
         if self.layout == LAYOUT_Q8:
             return self._quantize_8bit(x)
+        if self.layout == LAYOUT_Q2:
+            return self._quantize_subbyte(x, bits=2)
         if self.layout == LAYOUT_Q4:
             return self._quantize_subbyte(x, bits=4)
         if self.layout == LAYOUT_Q6:
@@ -148,6 +151,9 @@ class KVQuantSpec:
         if self.layout == LAYOUT_Q8:
             payload, scales = payload_scales
             return self._dequantize_8bit(payload, scales)
+        if self.layout == LAYOUT_Q2:
+            payload, scales = payload_scales
+            return self._dequantize_subbyte(payload, scales, bits=2)
         if self.layout == LAYOUT_Q4:
             payload, scales = payload_scales
             return self._dequantize_subbyte(payload, scales, bits=4)
@@ -201,8 +207,13 @@ class KVQuantSpec:
         # (64 levels). For Q4, MAX_MAG=8 and the writer must clamp to
         # MAX_MAG-1 = 7 so the dequant sees a real signed value; for Q6,
         # MAX_MAG=31 already aligns the storage with the 6-bit signed range
-        # so we clamp at MAX_MAG.
-        if bits == 4:
+        # so we clamp at MAX_MAG. 2-bit signed is [-2, 1] (4 levels), the
+        # signed lower bound -2 is exact under MAX_MAG=2 and the upper bound
+        # 1 is the symmetric truncation, so we clamp at MAX_MAG (no
+        # MAX_MAG-1 like Q4).
+        if bits == 2:
+            upper = max_mag
+        elif bits == 4:
             upper = max_mag - 1
         else:
             upper = max_mag
@@ -212,6 +223,20 @@ class KVQuantSpec:
 
         # Sign-extend via int32 shift (advanced indexing promotes to int64, which
         # would NOT round-trip -- see freetoken-kv-subbyte-quant memory).
+        if bits == 2:
+            # 2-bit signed: only the low 2 bits are stored; values -2..1.
+            # Layout: 32 values -> 8 bytes, 4 values per byte at bit positions
+            # 0, 2, 4, 6. value v at group position g within the byte goes to
+            # bit (2*g) of the byte. 1 << (2*g) = 1, 4, 16, 64.
+            mask2 = torch.tensor(0x3, dtype=torch.int32, device=qf.device)
+            lo = qf & mask2  # [..., NB, 32] in [0, 3]
+            # Unflatten into (NB, 8, 4) so each group of 4 values lands in one byte.
+            groups = lo.unflatten(-1, (BLOCK // 4, 4))  # [..., NB, 8, 4]
+            masks = torch.tensor([1, 4, 16, 64], dtype=torch.int32, device=qf.device)
+            packed = (groups * masks).sum(dim=-1).to(torch.uint8)  # [..., NB, 8]
+            payload = packed.flatten(-2)  # [..., NB * 8]
+            return (payload, scales)
+
         if bits == 4:
             # 4-bit signed: only the low 4 bits are stored; values -8..7.
             mask4 = torch.tensor(0xF, dtype=torch.int32, device=qf.device)
@@ -261,6 +286,17 @@ class KVQuantSpec:
         # payload shape: [..., NB * payload_bytes_per_block]
         payload_bytes = self.payload_bytes_per_block
         nb = payload.shape[-1] // payload_bytes
+        if bits == 2:
+            # 32 values -> 8 bytes, 4 values per byte at bit positions 0/2/4/6.
+            # Reconstruct the same (NB, 8, 4) layout the writer used.
+            bytes_view = payload.unflatten(-1, (nb, 8))  # [..., NB, 8]
+            shifts = torch.tensor([0, 2, 4, 6], dtype=torch.int32, device=payload.device)
+            groups = ((bytes_view.to(torch.int32).unsqueeze(-1) >> shifts) & 0x3)  # [..., NB, 8, 4]
+            vals2 = groups.flatten(-2)  # [..., NB, 32] in [0, 3]
+            # Sign-extend 2-bit: (v << 30) >> 30 == (v ^ 0x2) - 0x2.
+            vals = (vals2 << (32 - 2)) >> (32 - 2)  # [-2, 1]
+            return (vals.to(torch.float32) * scales.float().unsqueeze(-1)).flatten(-2)
+
         if bits == 4:
             # 16 bytes -> 32 nibbles (2 nibbles per byte: low, high).
             bytes_view = payload.unflatten(-1, (nb, 16))  # [..., NB, 16]
@@ -309,6 +345,24 @@ FP8_E4M3 = KVQuantSpec(
     name="fp8_e4m3", storage_dtype=torch.float8_e4m3fn, max_magnitude=448.0
 )
 
+# 2-bit signed scheme. 4 levels: -2, -1, 0, +1 (unsigned 0..3 maps via XOR 0x2 - 0x2).
+# Layout: 32 values -> 8 bytes, 4 values per byte at bit positions 0/2/4/6
+# (same positions the Q6 high plane uses for the top 2 bits -- the difference
+# is that Q2 has no low plane; the byte is the whole 2-bit code).
+# (8 + 2) / 32 = 0.3125 bytes/element. Among the smallest production K/V
+# cache densities. Rel_err on kurtotic K/V is ~0.20 (4x worse than q4_0);
+# the trade is worth it for very long contexts on memory-tight hardware
+# (300K+ context on 8 GB consumer GPU) where q4_0's 0.5625 B/elem is
+# still too much.
+Q2_0 = KVQuantSpec(
+    name="q2_0",
+    storage_dtype=STORAGE_BYTE_DTYPE,
+    max_magnitude=2.0,
+    layout=LAYOUT_Q2,
+    bits=2,
+    payload_bytes_per_block=8,
+)
+
 # Sub-byte schemes. Q4_0: 4-bit signed, 16 bytes/32 values = 0.5 byte/element.
 # The range is [-8, 7] (16 levels). max_magnitude = 8 -- the symmetric limit
 # the quantizer targets; values at the -8 boundary are exact, the +7 boundary
@@ -340,7 +394,7 @@ Q6_0 = KVQuantSpec(
 
 NONE = KVQuantSpec(name="auto", storage_dtype=None, max_magnitude=0.0)
 
-_BY_NAME = {spec.name: spec for spec in (NONE, Q8_0, FP8_E4M3, Q4_0, Q6_0)}
+_BY_NAME = {spec.name: spec for spec in (NONE, Q8_0, FP8_E4M3, Q2_0, Q4_0, Q6_0)}
 KV_CACHE_DTYPES = tuple(_BY_NAME)
 
 
