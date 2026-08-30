@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import torch
 
-from .quant import NONE, SCALE_DTYPE, KVQuantSpec
+from .quant import NONE, KVQuantSpec
 
 
 class QuantizedKVStorageMixin:
@@ -40,8 +40,12 @@ class QuantizedKVStorageMixin:
         """
         if not self._quant.enabled:
             return None
+        # Per-spec scale dtype: fp16 for the 8-bit / sub-byte schemes, fp8 E4M3
+        # for NVFP4 and the LM layouts (halves the per-block scale cost, which
+        # is what makes their advertised bytes_per_element real -- a hardcoded
+        # fp16 here silently inflated NVFP4 from 0.5625 to 0.625 B/elem).
         return torch.empty(
-            self._quant.scale_shape(kv_shape), device=device, dtype=SCALE_DTYPE
+            self._quant.scale_shape(kv_shape), device=device, dtype=self._quant.scale_dtype
         )
 
     def _store_kv_into(

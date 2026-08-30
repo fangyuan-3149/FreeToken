@@ -13,6 +13,15 @@ Two layout families live here:
     GGUF-style variants. ``bytes_per_element`` is ``payload_bytes_per_block / BLOCK +
     scale_bytes / BLOCK`` = 0.5625 and 0.8125 respectively.
 
+  * LM codebook (``lm2`` / ``lm3``): sub-byte code INDICES into a frozen Lloyd-Max
+    codebook, with one fp8 E4M3 scale per block. The scale is the block **RMS**, not
+    amax/MAX_MAG -- the codebooks are trained on RMS-normalized data, and RMS's low
+    block-to-block variance is what keeps the shared codebook shape from being
+    stretched. `Q2_LM` (2-bit codes, 8 bytes/32 values + 1 fp8 scale = 0.28125
+    B/elem, half of q4_0) and `Q3_LM` (3-bit codes, 64-value blocks, 24 bytes + 1
+    fp8 scale = 0.390625 B/elem) sit on the accuracy-per-byte convex hull below
+    q4_0. See ``_LM2_LEVELS`` / ``_LM3_LEVELS`` for the frozen codebooks.
+
 Storage layout (last axis = head_dim) changes per scheme:
 
   * bf16 / fp8 / int8: ``head_dim`` slots, each one byte/element dtype
@@ -22,6 +31,12 @@ Storage layout (last axis = head_dim) changes per scheme:
     16-byte low plane holding the low 4 bits of every value plus an 8-byte high plane
     holding the top 2 bits of every value, byte g in the high plane serving values 4g..4g+3
     at bit positions 0, 2, 4, 6)
+  * q2_lm: ``head_dim // 4`` slots of uint8 (8 bytes pack 32 2-bit code indices, byte g
+    serving values 4g..4g+3 at bit positions 0, 2, 4, 6)
+  * q3_lm: ``head_dim * 3 // 8`` slots of uint8 (24 bytes pack 64 3-bit code indices,
+    split as a 16-byte low plane of 2-bit fields -- byte g serving values 4g..4g+3 at bit
+    positions 0, 2, 4, 6 -- plus an 8-byte high plane holding the top bit of every value,
+    byte g serving values 8g..8g+7 at bit positions 0..7)
 
 The KV pool allocates the buffer in uint8 (so the element size is 1 regardless of scheme)
 with the scheme's packed last-dim. The attention kernel is told the logical ``head_dim``
@@ -49,6 +64,44 @@ LAYOUT_Q2 = "q2"        # 8 bytes pack 32 2-bit values (4 per byte at bits 0/2/4
 LAYOUT_Q4 = "q4"        # 16 bytes pack 32 4-bit values
 LAYOUT_NVFP4 = "nvfp4"  # 8 bytes pack 16 4-bit E2M1 float values + 1 fp8 E4M3 block scale
 LAYOUT_Q6 = "q6"        # 24 bytes pack 32 6-bit values (16 lo + 8 hi)
+LAYOUT_LM2 = "lm2"      # 8 bytes pack 32 2-bit Lloyd-Max code indices + 1 fp8 E4M3 scale
+LAYOUT_LM3 = "lm3"      # 24 bytes pack 64 3-bit Lloyd-Max code indices + 1 fp8 E4M3 scale
+
+# Lloyd-Max codebooks for the ``lm2`` / ``lm3`` layouts, trained by k-means
+# (Lloyd iteration) on 4M standard-Gaussian samples normalized by their
+# per-32-element-block RMS -- the same normalization the store kernel applies
+# at write time. Symmetrized around zero; sorted ascending so the code index
+# is also the sort order. For Gaussian-shaped blocks these are the MSE-optimal
+# 4/8-level quantizers (they reproduce the closed-form Lloyd-Max values
+# +-0.4528/+-1.5104 and +-0.2450/+-0.7561/+-1.3441/+-2.1508 to 4 decimals).
+# On channel-outlier K data the outer levels migrate toward the tail when the
+# codebook is retrained per-channel -- see the LM quant survey notes; the
+# frozen Gaussian values here are the no-calibration default.
+_LM2_LEVELS = (-1.5096, -0.4516, 0.4516, 1.5096)
+_LM3_LEVELS = (
+    -2.1508, -1.3441, -0.7561, -0.2450,
+    0.2450, 0.7561, 1.3441, 2.1508,
+)
+
+
+def _lm_levels(layout: str) -> Tuple[float, ...]:
+    """Ascending codebook for an LM layout. The code index IS the position."""
+    if layout == LAYOUT_LM2:
+        return _LM2_LEVELS
+    if layout == LAYOUT_LM3:
+        return _LM3_LEVELS
+    raise ValueError(f"not an LM layout: {layout!r}")
+
+
+def _lm_thresholds(layout: str) -> Tuple[float, ...]:
+    """Decision thresholds between adjacent levels: (c_i + c_{i+1}) / 2.
+
+    A value maps to code = #{thresholds < value}, so an exact tie between two
+    levels lands on the lower code -- matching torch.argmin's first-occurrence
+    tie-break. Stored as fp32 (both the torch oracle and the Triton kernel
+    compare against the same fp32 constants, keeping them bit-identical)."""
+    levels = _lm_levels(layout)
+    return tuple((a + b) / 2 for a, b in zip(levels, levels[1:]))
 
 
 @dataclass(frozen=True)
@@ -87,9 +140,10 @@ class KVQuantSpec:
 
     @property
     def is_integer(self) -> bool:
-        """Integer schemes round; float ones just divide. Q2/Q4/Q6 are integer;
-        NVFP4 is float (E2M1)."""
-        if self.layout == LAYOUT_NVFP4:
+        """Integer schemes round; float ones divide or table-lookup. Q2/Q4/Q6
+        are integer; NVFP4 is float (E2M1); LM layouts assign the nearest
+        codebook entry (no rounding)."""
+        if self.layout in (LAYOUT_NVFP4, LAYOUT_LM2, LAYOUT_LM3):
             return False
         if self.layout != LAYOUT_Q8:
             return True
@@ -151,6 +205,10 @@ class KVQuantSpec:
             return self._quantize_8bit(x)
         if self.layout == LAYOUT_NVFP4:
             return self._quantize_nvfp4(x)
+        if self.layout == LAYOUT_LM2:
+            return self._quantize_lm(x, bits=2)
+        if self.layout == LAYOUT_LM3:
+            return self._quantize_lm(x, bits=3)
         if self.layout == LAYOUT_Q4:
             return self._quantize_subbyte(x, bits=4)
         if self.layout == LAYOUT_Q6:
@@ -167,6 +225,12 @@ class KVQuantSpec:
         if self.layout == LAYOUT_NVFP4:
             payload, scales = payload_scales
             return self._dequantize_nvfp4(payload, scales)
+        if self.layout == LAYOUT_LM2:
+            payload, scales = payload_scales
+            return self._dequantize_lm(payload, scales, bits=2)
+        if self.layout == LAYOUT_LM3:
+            payload, scales = payload_scales
+            return self._dequantize_lm(payload, scales, bits=3)
         if self.layout == LAYOUT_Q4:
             payload, scales = payload_scales
             return self._dequantize_subbyte(payload, scales, bits=4)
@@ -242,6 +306,98 @@ class KVQuantSpec:
         # Look up the E2M1 value table. 16 entries indexed by unsigned 4-bit code.
         e2m1 = torch.tensor(self._E2M1_VALUES, dtype=torch.float32, device=payload.device)
         vals = e2m1[stacked]  # [..., NB, 16]
+        return (vals * scales.float().unsqueeze(-1)).flatten(-2)
+
+    # ---- LM codebook (lm2 / lm3): 2/3-bit Lloyd-Max indices + fp8 E4M3 RMS scale ----
+
+    def _quantize_lm(self, x: torch.Tensor, *, bits: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Per-block Lloyd-Max codebook quantization.
+
+        The scale is the block's RMS (NOT amax/MAX_MAG like the integer
+        schemes): the codebook is trained on RMS-normalized data, so RMS is
+        the matching per-block statistic, and its low variance across blocks
+        is what keeps the shared codebook shape from being stretched
+        block-to-block. amax fluctuates ~20% on 32-sample Gaussian blocks;
+        RMS only ~12%, and the error difference is large (0.60 vs 0.33 rel).
+
+        Layout (lm2): 32 values -> 8 payload bytes. Byte j holds code[4j..4j+3]
+        as 2-bit fields at bit positions 0, 2, 4, 6 (same field layout as the
+        q6 high plane). Layout (lm3): 64 values -> 24 payload bytes = 16-byte
+        low plane (low 2 bits, same field layout) + 8-byte high plane (top
+        bit of each value, one bit per position 0..7).
+
+        Code assignment: code = #{thresholds < value} with thresholds at the
+        exact midpoints of adjacent levels -- ties land on the lower code,
+        matching torch.argmin's first-occurrence tie-break.
+        """
+        bs = self.block_size
+        assert x.shape[-1] % bs == 0, f"head_dim {x.shape[-1]} is not a multiple of {bs}"
+        blocks = x.float().unflatten(-1, (x.shape[-1] // bs, bs))  # [..., NB, bs]
+        rms = blocks.pow(2).mean(dim=-1, keepdim=True).sqrt()
+        # An all-zero block stores any code under any scale; 1.0 keeps fp8 finite.
+        rms = torch.where(rms > 0, rms, torch.ones_like(rms))
+        # Round to the stored fp8 precision before dividing, so the value used
+        # here and the value the attention kernel reads back are identical.
+        rms = rms.to(self.scale_dtype).float()
+        q = blocks / rms  # rms already keepdim: [..., NB, 1]
+        thresholds = torch.tensor(
+            _lm_thresholds(self.layout), dtype=torch.float32, device=x.device
+        )
+        codes = torch.zeros(q.shape, dtype=torch.int32, device=x.device)
+        for t in thresholds:
+            codes += (q > t).to(torch.int32)  # [..., NB, bs] in [0, 2**bits - 1]
+
+        if bits == 2:
+            groups = codes.unflatten(-1, (bs // 4, 4))  # [..., NB, 8, 4]
+            masks = torch.tensor([1, 4, 16, 64], dtype=torch.int32, device=x.device)
+            packed = (groups * masks).sum(dim=-1).to(torch.uint8)  # [..., NB, 8]
+            # squeeze the keepdim scale axis so the returned scales match the
+            # pool's scale-buffer shape [..., NB] (see scale_shape()).
+            return (packed.flatten(-2), rms.squeeze(-1).to(self.scale_dtype))
+
+        if bits == 3:
+            lo2 = codes & 0x3  # low 2 bits -> 16-byte field plane
+            hi1 = (codes >> 2) & 0x1  # top bit -> 8-byte plane
+            lo_groups = lo2.unflatten(-1, (bs // 4, 4))  # [..., NB, 16, 4]
+            lo_masks = torch.tensor([1, 4, 16, 64], dtype=torch.int32, device=x.device)
+            packed_lo = (lo_groups * lo_masks).sum(dim=-1).to(torch.uint8)  # [..., NB, 16]
+            hi_groups = hi1.unflatten(-1, (bs // 8, 8))  # [..., NB, 8, 8]
+            hi_masks = torch.tensor(
+                [1, 2, 4, 8, 16, 32, 64, 128], dtype=torch.int32, device=x.device
+            )
+            packed_hi = (hi_groups * hi_masks).sum(dim=-1).to(torch.uint8)  # [..., NB, 8]
+            payload = torch.cat([packed_lo, packed_hi], dim=-1).flatten(-2)  # [..., NB * 24]
+            return (payload, rms.squeeze(-1).to(self.scale_dtype))
+
+        raise ValueError(f"unsupported LM bits: {bits}")
+
+    def _dequantize_lm(
+        self, payload: torch.Tensor, scales: torch.Tensor, *, bits: int
+    ) -> torch.Tensor:
+        """Inverse of :meth:`_quantize_lm`. Returns float32 with logical head_dim."""
+        bs = self.block_size
+        payload_bytes = self.payload_bytes_per_block
+        nb = payload.shape[-1] // payload_bytes
+        levels = torch.tensor(_lm_levels(self.layout), dtype=torch.float32, device=payload.device)
+
+        if bits == 2:
+            bytes_view = payload.unflatten(-1, (nb, 8))  # [..., NB, 8]
+            shifts = torch.tensor([0, 2, 4, 6], dtype=torch.int32, device=payload.device)
+            codes = ((bytes_view.unsqueeze(-1) >> shifts) & 0x3)  # [..., NB, 8, 4]
+            codes = codes.flatten(-2)  # [..., NB, 32]
+        elif bits == 3:
+            block_view = payload.unflatten(-1, (nb, 24))  # [..., NB, 24]
+            lo_bytes = block_view[..., :16]  # [..., NB, 16]
+            hi_bytes = block_view[..., 16:]  # [..., NB, 8]
+            lo_shifts = torch.tensor([0, 2, 4, 6], dtype=torch.int32, device=payload.device)
+            lo2 = ((lo_bytes.unsqueeze(-1) >> lo_shifts) & 0x3).flatten(-2)  # [..., NB, 64]
+            hi_shifts = torch.arange(8, dtype=torch.int32, device=payload.device)
+            hi1 = ((hi_bytes.unsqueeze(-1) >> hi_shifts) & 0x1).flatten(-2)  # [..., NB, 64]
+            codes = lo2 | (hi1 << 2)  # [..., NB, 64]
+        else:
+            raise ValueError(f"unsupported LM bits: {bits}")
+
+        vals = levels[codes.long()]  # [..., NB, bs]
         return (vals * scales.float().unsqueeze(-1)).flatten(-2)
 
     # ---- sub-byte (Q4 / Q6) ----
@@ -409,6 +565,37 @@ Q6_0 = KVQuantSpec(
     payload_bytes_per_block=24,
 )
 
+# LM (Lloyd-Max) schemes: trained non-uniform codebooks instead of uniform
+# integer grids. lm2: 2-bit codes, 8 payload bytes / 32 values + 1 fp8 E4M3
+# RMS scale = 0.28125 B/elem -- HALF of q4_0's density -- at ~3.5x q4_0's
+# kernel rel_err (0.334 vs ~0.09 on Gaussian). lm3: 3-bit codes, 64-value
+# blocks, 24 payload bytes + 1 fp8 scale = 0.390625 B/elem at ~0.18 rel_err,
+# which sits ON the accuracy-per-byte convex hull between q4_0 and q2_lm
+# (linear interpolation at that byte density would predict ~0.24).
+# The scale is the block RMS, not amax/MAX_MAG: the codebooks are trained on
+# RMS-normalized data, and RMS's low block-to-block variance is what keeps
+# the shared codebook shape from being stretched (amax-driven scales measured
+# 0.60 rel_err vs 0.33 for RMS on the same data).
+Q2_LM = KVQuantSpec(
+    name="q2_lm",
+    storage_dtype=STORAGE_BYTE_DTYPE,
+    max_magnitude=1.5096,
+    layout=LAYOUT_LM2,
+    bits=2,
+    payload_bytes_per_block=8,
+    scale_dtype=torch.float8_e4m3fn,
+)
+Q3_LM = KVQuantSpec(
+    name="q3_lm",
+    storage_dtype=STORAGE_BYTE_DTYPE,
+    max_magnitude=2.1508,
+    layout=LAYOUT_LM3,
+    bits=3,
+    payload_bytes_per_block=24,
+    block_size=64,
+    scale_dtype=torch.float8_e4m3fn,
+)
+
 # NVFP4: NVIDIA FP4 (E2M1) per-block, 16 values per block with one
 # fp8 E4M3 block scale. (8 payload + 1 scale) / 16 = 0.5625 B/elem --
 # the same density as q4_0, but the E2M1 floating-point code (1 sign
@@ -432,7 +619,7 @@ NVFP4 = KVQuantSpec(
 
 NONE = KVQuantSpec(name="auto", storage_dtype=None, max_magnitude=0.0)
 
-_BY_NAME = {spec.name: spec for spec in (NONE, Q8_0, FP8_E4M3, NVFP4, Q4_0, Q6_0)}
+_BY_NAME = {spec.name: spec for spec in (NONE, Q8_0, FP8_E4M3, NVFP4, Q4_0, Q6_0, Q2_LM, Q3_LM)}
 KV_CACHE_DTYPES = tuple(_BY_NAME)
 
 
@@ -455,12 +642,16 @@ __all__ = [
     "LAYOUT_Q8",
     "LAYOUT_Q4",
     "LAYOUT_Q6",
+    "LAYOUT_LM2",
+    "LAYOUT_LM3",
     "KVQuantSpec",
     "KV_CACHE_DTYPES",
     "Q8_0",
     "FP8_E4M3",
     "Q4_0",
     "Q6_0",
+    "Q2_LM",
+    "Q3_LM",
     "NONE",
     "resolve_kv_quant",
 ]

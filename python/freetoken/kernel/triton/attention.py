@@ -116,6 +116,53 @@ def _load_kv(
             ),
         )
         vals = tl.where(sign_bit == 1, -mag, mag)
+    elif LAYOUT == "lm2":
+        # LM 2-bit: 32-value blocks, 8 payload bytes; byte j holds code[4j..4j+3]
+        # as 2-bit fields at bit positions 0, 2, 4, 6. The code indexes the
+        # frozen Gaussian Lloyd-Max codebook (quant.py _LM2_LEVELS, ascending).
+        block_idx = elem_offsets >> 5
+        in_block = elem_offsets & 31
+        byte_offs = block_idx * 8 + (in_block >> 2)
+        shift = (in_block & 3) * 2
+        packed = tl.load(ptr + slot_base + byte_offs, mask=elem_mask, other=0).to(tl.int32)
+        code = (packed >> shift) & 0x3
+        vals = tl.where(
+            code == 0, -1.5096,
+            tl.where(code == 1, -0.4516,
+                     tl.where(code == 2, 0.4516, 1.5096)),
+        )
+    elif LAYOUT == "lm3":
+        # LM 3-bit: 64-value blocks, 24 payload bytes = 16-byte low plane
+        # (low 2 bits, 2-bit fields at positions 0/2/4/6) + 8-byte high plane
+        # (top bit, one bit per position 0..7). Codebook: quant.py _LM3_LEVELS.
+        block_idx = elem_offsets >> 6
+        in_block = elem_offsets & 63
+        lo_byte = block_idx * 24 + (in_block >> 2)
+        hi_byte = block_idx * 24 + 16 + (in_block >> 3)
+        lo = tl.load(ptr + slot_base + lo_byte, mask=elem_mask, other=0).to(tl.int32)
+        hi = tl.load(ptr + slot_base + hi_byte, mask=elem_mask, other=0).to(tl.int32)
+        lo2 = (lo >> ((in_block & 3) * 2)) & 0x3
+        hi1 = (hi >> (in_block & 7)) & 0x1
+        code = lo2 | (hi1 << 2)
+        vals = tl.where(
+            code == 0, -2.1508,
+            tl.where(
+                code == 1, -1.3441,
+                tl.where(
+                    code == 2, -0.7561,
+                    tl.where(
+                        code == 3, -0.2450,
+                        tl.where(
+                            code == 4, 0.2450,
+                            tl.where(
+                                code == 5, 0.7561,
+                                tl.where(code == 6, 1.3441, 2.1508),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        )
     else:
         tl.static_assert(False, f"unknown LAYOUT {LAYOUT!r}")
 

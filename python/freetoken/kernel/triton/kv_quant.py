@@ -30,6 +30,8 @@ import triton
 import triton.language as tl
 
 from freetoken.kvcache.quant import BLOCK
+from freetoken.kvcache.quant import LAYOUT_LM2 as _LAYOUT_LM2
+from freetoken.kvcache.quant import LAYOUT_LM3 as _LAYOUT_LM3
 from freetoken.kvcache.quant import LAYOUT_NVFP4 as _LAYOUT_NVFP4
 from freetoken.kvcache.quant import LAYOUT_Q4 as _LAYOUT_Q4
 from freetoken.kvcache.quant import LAYOUT_Q6 as _LAYOUT_Q6
@@ -41,6 +43,8 @@ LAYOUT_Q8 = tl.constexpr(_LAYOUT_Q8)
 LAYOUT_Q4 = tl.constexpr(_LAYOUT_Q4)
 LAYOUT_Q6 = tl.constexpr(_LAYOUT_Q6)
 LAYOUT_NVFP4 = tl.constexpr(_LAYOUT_NVFP4)
+LAYOUT_LM2 = tl.constexpr(_LAYOUT_LM2)
+LAYOUT_LM3 = tl.constexpr(_LAYOUT_LM3)
 
 
 @triton.jit
@@ -64,7 +68,14 @@ def _store_kv_quant_kernel(
     IS_INT: tl.constexpr,
     BLOCK: tl.constexpr,
     NBLOCK: tl.constexpr,  # D // BLOCK
-    LAYOUT: tl.constexpr,  # "q8" | "q4" | "q6"
+    LAYOUT: tl.constexpr,  # "q8" | "q4" | "q6" | "lm2" | "lm3"
+    T0: tl.float32,
+    T1: tl.float32,
+    T2: tl.float32,
+    T3: tl.float32,
+    T4: tl.float32,
+    T5: tl.float32,
+    T6: tl.float32,
 ):
     tok = tl.program_id(0)
     head = tl.program_id(1)
@@ -82,44 +93,67 @@ def _store_kv_quant_kernel(
         sc_ptr = vs_ptr if is_v else ks_ptr
 
         x = tl.load(src_ptr + tok * stride_kt + head * stride_kh + offs).to(tl.float32)
-        amax = tl.max(tl.abs(x), axis=1)
-        # An all-zero block quantizes to zeros under any positive scale; 1.0 keeps the
-        # division finite.
-        scale = tl.where(amax > 0, amax / MAX_MAG, 1.0)
-        # Round to the stored precision before dividing, so the value written here and
-        # the value the attention kernels read back are scaled by the identical number.
-        scale = scale.to(sc_ptr.dtype.element_ty).to(tl.float32)
-        # div_rn, not `/`: the plain operator is free to lower to a reciprocal multiply,
-        # which disagrees with the torch reference on values sitting exactly between two
-        # quantization steps. IEEE round-to-nearest divide makes the two bit-identical.
-        q = tl.math.div_rn(x, scale[:, None])
-        if IS_INT:
-            # Round half away from zero (what GGUF's Q8_0 / Q4_0 / Q6_0 do), then clamp.
-            # The 4-bit signed range is [-8, 7] (16 levels, stored as unsigned
-            # 0..15 -- 8 maps to -8 in the XOR-sub sign extension) and 6-bit
-            # signed is [-32, 31] (64 levels). For Q4, MAX_MAG=8 and the
-            # writer must clamp at MAX_MAG-1=7 so the dequant sees a real
-            # signed value; for Q6, MAX_MAG=31 already aligns the storage
-            # with the 6-bit signed range so we clamp at MAX_MAG.
-            q = tl.where(q >= 0, tl.floor(q + 0.5), tl.ceil(q - 0.5))
-            if LAYOUT == LAYOUT_Q4:
-                q = tl.minimum(tl.maximum(q, -MAX_MAG), MAX_MAG - 1.0)
-            else:
-                q = tl.minimum(tl.maximum(q, -MAX_MAG), MAX_MAG)
+        if LAYOUT == LAYOUT_LM2 or LAYOUT == LAYOUT_LM3:
+            # LM layouts: scale = block RMS (NOT amax/MAX_MAG). The codebooks are
+            # trained on RMS-normalized data; RMS's low block-to-block variance
+            # is what keeps the shared codebook shape from being stretched
+            # (amax-driven scales measured 0.60 rel_err vs 0.33 for RMS).
+            # NOTE: unlike amax, a fp32 sum is reduction-order dependent, so the
+            # fp8-rounded scale can differ from the torch oracle by one fp8 step
+            # on rare blocks. The kernel itself is deterministic run-to-run; the
+            # tests assert code/pack exactness against forced scales instead of
+            # end-to-end bit-exactness.
+            scale = tl.sqrt(tl.sum(x * x, axis=1) / BLOCK)
+            scale = tl.where(scale > 0.0, scale, 1.0)
+            scale = scale.to(sc_ptr.dtype.element_ty).to(tl.float32)
+            q = tl.math.div_rn(x, scale[:, None])
+            # code = #{thresholds < q}: thresholds sit at the exact midpoints of
+            # adjacent levels, so ties land on the lower code, matching the
+            # oracle's torch.argmin first-occurrence tie-break.
+            code = (q > T0).to(tl.int32) + (q > T1).to(tl.int32) + (q > T2).to(tl.int32)
+            if LAYOUT == LAYOUT_LM3:
+                code += (q > T3).to(tl.int32) + (q > T4).to(tl.int32)
+                code += (q > T5).to(tl.int32) + (q > T6).to(tl.int32)
         else:
-            if LAYOUT == LAYOUT_NVFP4:
-                # E2M1 4-bit float: q is already in [-6, 6] from the div_rn above
-                # (scale = amax / 6 ensures |q| <= 6). The pack step further down
-                # calls _round_e2m1, so we keep `q` as fp32 here.
-                pass
+            code = tl.zeros([NBLOCK, BLOCK], dtype=tl.int32)
+            amax = tl.max(tl.abs(x), axis=1)
+            # An all-zero block quantizes to zeros under any positive scale; 1.0 keeps the
+            # division finite.
+            scale = tl.where(amax > 0, amax / MAX_MAG, 1.0)
+            # Round to the stored precision before dividing, so the value written here and
+            # the value the attention kernels read back are scaled by the identical number.
+            scale = scale.to(sc_ptr.dtype.element_ty).to(tl.float32)
+            # div_rn, not `/`: the plain operator is free to lower to a reciprocal multiply,
+            # which disagrees with the torch reference on values sitting exactly between two
+            # quantization steps. IEEE round-to-nearest divide makes the two bit-identical.
+            q = tl.math.div_rn(x, scale[:, None])
+            if IS_INT:
+                # Round half away from zero (what GGUF's Q8_0 / Q4_0 / Q6_0 do), then clamp.
+                # The 4-bit signed range is [-8, 7] (16 levels, stored as unsigned
+                # 0..15 -- 8 maps to -8 in the XOR-sub sign extension) and 6-bit
+                # signed is [-32, 31] (64 levels). For Q4, MAX_MAG=8 and the
+                # writer must clamp at MAX_MAG-1=7 so the dequant sees a real
+                # signed value; for Q6, MAX_MAG=31 already aligns the storage
+                # with the 6-bit signed range so we clamp at MAX_MAG.
+                q = tl.where(q >= 0, tl.floor(q + 0.5), tl.ceil(q - 0.5))
+                if LAYOUT == LAYOUT_Q4:
+                    q = tl.minimum(tl.maximum(q, -MAX_MAG), MAX_MAG - 1.0)
+                else:
+                    q = tl.minimum(tl.maximum(q, -MAX_MAG), MAX_MAG)
             else:
-                # The native fp32 -> float8e4nv downcast does not round to nearest on
-                # every arch (it lowers as a truncating fp32 -> fp16 -> e4m3 double-round
-                # on sm_89), so values just above a grid midpoint collapse downward and
-                # disagree with the RNE torch reference. Round explicitly first.
-                from freetoken.kernel.triton.e4m3_compat import round_e4m3
+                if LAYOUT == LAYOUT_NVFP4:
+                    # E2M1 4-bit float: q is already in [-6, 6] from the div_rn above
+                    # (scale = amax / 6 ensures |q| <= 6). The pack step further down
+                    # calls _round_e2m1, so we keep `q` as fp32 here.
+                    pass
+                else:
+                    # The native fp32 -> float8e4nv downcast does not round to nearest on
+                    # every arch (it lowers as a truncating fp32 -> fp16 -> e4m3 double-round
+                    # on sm_89), so values just above a grid midpoint collapse downward and
+                    # disagree with the RNE torch reference. Round explicitly first.
+                    from freetoken.kernel.triton.e4m3_compat import round_e4m3
 
-                q = round_e4m3(tl.minimum(tl.maximum(q, -MAX_MAG), MAX_MAG))
+                    q = round_e4m3(tl.minimum(tl.maximum(q, -MAX_MAG), MAX_MAG))
 
         # ---- pack into the storage dtype ----
         if LAYOUT == LAYOUT_Q8:
@@ -219,6 +253,55 @@ def _store_kv_quant_kernel(
                 dst_ptr + slot * stride_ct + head * stride_ch + byte_offs,
                 packed,
             )
+        elif LAYOUT == LAYOUT_LM2:
+            # 32 code indices (0..3) -> 8 bytes as 2-bit fields: byte j holds
+            # code[4j..4j+3] at bit positions 0, 2, 4, 6 (same field layout as
+            # the q6 high plane).
+            groups = tl.reshape(code, (NBLOCK, 8, 4))
+            idx = tl.arange(0, 4)
+            masks = tl.where(
+                idx == 0, 1,
+                tl.where(idx == 1, 4,
+                         tl.where(idx == 2, 16, 64)),
+            )
+            packed = tl.sum(groups * masks[None, None, :], axis=2).to(tl.uint8)
+            byte_offs = tl.arange(0, NBLOCK)[:, None] * 8 + tl.arange(0, 8)[None, :]
+            tl.store(
+                dst_ptr + slot * stride_ct + head * stride_ch + byte_offs,
+                packed,
+            )
+        elif LAYOUT == LAYOUT_LM3:
+            # 64 code indices (0..7) -> 24 bytes: 16-byte low plane (low 2 bits,
+            # same 2-bit field layout) + 8-byte high plane (top bit, one bit per
+            # position 0..7). Layout per block: lo first, then hi.
+            lo2 = code & 0x3
+            hi1 = (code >> 2) & 0x1
+            lo_groups = tl.reshape(lo2, (NBLOCK, 16, 4))
+            idx4 = tl.arange(0, 4)
+            masks4 = tl.where(
+                idx4 == 0, 1,
+                tl.where(idx4 == 1, 4,
+                         tl.where(idx4 == 2, 16, 64)),
+            )
+            packed_lo = tl.sum(lo_groups * masks4[None, None, :], axis=2).to(tl.uint8)
+            hi_groups = tl.reshape(hi1, (NBLOCK, 8, 8))
+            # Position masks 1,2,4,...,128 via exp2 (exact for 2^0..2^7 in fp32,
+            # and the sum stays <= 255, so the uint8 cast is exact).
+            idx8 = tl.arange(0, 8).to(tl.float32)
+            packed_hi = tl.sum(
+                hi_groups.to(tl.float32) * tl.exp2(idx8)[None, None, :], axis=2
+            ).to(tl.uint8)
+            base = tl.arange(0, NBLOCK)[:, None] * 24
+            lo_offs = base + tl.arange(0, 16)[None, :]
+            hi_offs = base + 16 + tl.arange(0, 8)[None, :]
+            tl.store(
+                dst_ptr + slot * stride_ct + head * stride_ch + lo_offs,
+                packed_lo,
+            )
+            tl.store(
+                dst_ptr + slot * stride_ct + head * stride_ch + hi_offs,
+                packed_hi,
+            )
         else:
             tl.static_assert(False, f"unknown LAYOUT {LAYOUT!r}")
 
@@ -245,14 +328,14 @@ def store_kv_quant(
     dtype, where ``D_PHYSICAL == D`` for 8-bit and ``D * bits // 8`` for sub-byte.
     ``k_scale``/``v_scale`` are ``[slots, heads, D // BLOCK]`` in fp16.
     """
-    from freetoken.kvcache.quant import BLOCK
+    from freetoken.kvcache.quant import BLOCK, _lm_thresholds
 
     num_tokens, num_heads, head_dim = k.shape
     if num_tokens == 0:
         return
-    # NVFP4 quantizes in 16-element blocks; Q2/Q4/Q6 (and q8 for 32-wide tiles) in 32.
-    # We pick the per-kernel block size from the spec so a single kernel can serve both.
-    block = spec.block_size if spec.layout == "nvfp4" else BLOCK
+    # Per-kernel block size from the spec: NVFP4 quantizes in 16-element
+    # blocks, q3_lm in 64; q2_lm and the Q2/Q4/Q6 (and q8) schemes in 32.
+    block = spec.block_size if spec.layout in ("nvfp4", "lm2", "lm3") else BLOCK
     assert head_dim % block == 0, f"head_dim {head_dim} not a multiple of {block}"
     # The cache's last axis is the PACKED byte count, which differs from the source's
     # head_dim for sub-byte schemes. We pass both as constexprs to the kernel.
@@ -261,6 +344,13 @@ def store_kv_quant(
     assert d_physical == expected_physical, (
         f"cache physical dim {d_physical} != spec {spec.name} expected {expected_physical}"
     )
+    # LM decision thresholds (midpoints of adjacent codebook levels). Unused
+    # layouts get zeros -- the LM code paths are compiled out for them.
+    thresholds = [0.0] * 7
+    if spec.layout in ("lm2", "lm3"):
+        thresholds[: len(_lm_thresholds(spec.layout))] = [
+            float(t) for t in _lm_thresholds(spec.layout)
+        ]
     _store_kv_quant_kernel[(num_tokens, num_heads)](
         k,
         v,
@@ -282,6 +372,13 @@ def store_kv_quant(
         BLOCK=block,
         NBLOCK=head_dim // block,
         LAYOUT=spec.layout,
+        T0=thresholds[0],
+        T1=thresholds[1],
+        T2=thresholds[2],
+        T3=thresholds[3],
+        T4=thresholds[4],
+        T5=thresholds[5],
+        T6=thresholds[6],
         num_warps=4,
     )
 
